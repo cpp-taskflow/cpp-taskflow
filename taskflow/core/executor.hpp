@@ -1112,6 +1112,12 @@ class Executor {
   std::unordered_map<std::thread::id, Worker*> _t2w;
   std::unordered_set<std::shared_ptr<ObserverInterface>> _observers;
 
+  // true when constructed with 0 workers (inline mode).
+  bool _inlined {false};
+
+  // synchronous topological run of a static graph.
+  void _run_inline(Graph&);
+
   void _shutdown();
   void _observer_prologue(Worker&, Node*);
   void _observer_epilogue(Worker&, Node*);
@@ -1198,10 +1204,12 @@ inline Executor::Executor(size_t N, std::shared_ptr<WorkerInterface> wif) :
   _buffers  (std::bit_width(N)), // Empirically, we find that log2(N) performs best.
   _notifier (N) {
 
+  // 0 workers => inline mode, run graphs on the caller.
   if(N == 0) {
-    TF_THROW("executor must define at least one worker");
+    _inlined = true;
+    return;
   }
-  
+
   // If spawning N threads fails, shut down any created threads before 
   // rethrowing the exception.
 #ifndef TF_DISABLE_EXCEPTION_HANDLING
@@ -1277,6 +1285,10 @@ inline Worker* Executor::this_worker() {
 
 // Function: this_worker_id
 inline int Executor::this_worker_id() const {
+  // in inline mode the calling thread is the sole worker 0.
+  if(_inlined) {
+    return 0;
+  }
   auto i = _t2w.find(std::this_thread::get_id());
   return i == _t2w.end() ? -1 : static_cast<int>(i->second->_id);
 }
@@ -1396,7 +1408,7 @@ inline bool Executor::_explore_task(Worker& w, Node*& t) {
 
     if(++num_steals > MAX_STEALS) {
       std::this_thread::yield();
-      if(num_steals > 150 + MAX_STEALS) {
+      if(num_steals > 16 + MAX_STEALS) {
         break;
       }
     }
@@ -1448,7 +1460,7 @@ inline bool Executor::_explore_task(Worker& w, Node*& t) {
     // If the number of empty steals reaches MAX_STEALS, exit the loop.
     if (++num_steals > MAX_STEALS) {
       std::this_thread::yield();
-      if(num_steals > 150 + MAX_STEALS) {
+      if(num_steals > 16 + MAX_STEALS) {
         break;
       }
     }
@@ -2221,6 +2233,29 @@ tf::Future<void> Executor::run_until(Taskflow&& f, P&& pred) {
 template <typename P, typename C>
 tf::Future<void> Executor::run_until(Taskflow& f, P&& p, C&& c) {
 
+  // inline (0-worker) mode runs the graph synchronously on
+  // the calling thread and returns an already-satisfied future.
+  if(_inlined) {
+    std::exception_ptr eptr;
+    try {
+      while(!p()) {
+        _run_inline(f._graph);
+      }
+    }
+    catch(...) {
+      eptr = std::current_exception();
+    }
+    c();
+    std::promise<void> promise;
+    if(eptr) {
+      promise.set_exception(eptr);
+    }
+    else {
+      promise.set_value();
+    }
+    return tf::Future<void>(promise.get_future());
+  }
+
   // No need to create a real topology but returns an dummy future for invariant.
   if(f.empty() || p()) {
     c();
@@ -2362,6 +2397,12 @@ void Executor::_corun_until(Worker& w, P&& stop_predicate) {
 template <typename T>
 void Executor::corun(T& target) {
 
+  // inline mode has no workers; run the graph synchronously.
+  if(_inlined) {
+    _run_inline(retrieve_graph(target));
+    return;
+  }
+
   Worker* w = this_worker();
   if(w == nullptr) {
     TF_THROW("corun must be called by a worker of the executor");
@@ -2369,6 +2410,87 @@ void Executor::corun(T& target) {
 
   NodeBase anchor;
   _corun_graph(*w, retrieve_graph(target), nullptr, &anchor);
+}
+
+
+// Procedure: _run_inline
+// Executes a fully-built static graph on the calling thread in topological
+// order, mirroring the executor's scheduling rules: a node runs once its
+// strong (non-conditioner) predecessors are met; a condition node runs its
+// int() work and activates only the selected successor.  Handles Static,
+// Module (composed_of, recursed), Condition/MultiCondition and placeholders.
+// Assumes the graph is complete before run (no tasks added during execution)
+// and no subflow/runtime tasks
+inline void Executor::_run_inline(Graph& graph) {
+  if(graph.empty()) {
+    return;
+  }
+
+  std::unordered_map<Node*, size_t> remaining;  // unmet strong predecessors
+  std::unordered_set<Node*> pushed;
+  remaining.reserve(graph.size());
+  std::vector<Node*> ready;
+
+  for(Node* n : graph) {
+    size_t strong = 0;
+    for(size_t i = n->_num_successors; i < n->_edges.size(); ++i) {
+      strong += !n->_edges[i]->_is_conditioner();
+    }
+    remaining.emplace(n, strong);
+    if(n->num_predecessors() == 0) {
+      ready.push_back(n);
+      pushed.insert(n);
+    }
+  }
+
+  // A condition forces its chosen successor to run regardless of strong deps.
+  auto activate = [&](Node* s) {
+    remaining[s] = 0;
+    if(pushed.insert(s).second) {
+      ready.push_back(s);
+    }
+  };
+
+  while(!ready.empty()) {
+    Node* n = ready.back();
+    ready.pop_back();
+
+    switch(n->_handle.index()) {
+      case Node::STATIC:
+        std::get_if<Node::Static>(&n->_handle)->work();
+        break;
+      case Node::MODULE:
+        _run_inline(std::get_if<Node::Module>(&n->_handle)->graph);
+        break;
+      case Node::CONDITION: {
+        int idx = std::get_if<Node::Condition>(&n->_handle)->work();
+        if(idx >= 0 && static_cast<size_t>(idx) < n->_num_successors) {
+          activate(n->_edges[static_cast<size_t>(idx)]);
+        }
+        continue;  // conditioners propagate only to the chosen successor
+      }
+      case Node::MULTI_CONDITION: {
+        for(int idx : std::get_if<Node::MultiCondition>(&n->_handle)->work()) {
+          if(idx >= 0 && static_cast<size_t>(idx) < n->_num_successors) {
+            activate(n->_edges[static_cast<size_t>(idx)]);
+          }
+        }
+        continue;
+      }
+      default:
+        break;  // placeholder / pure join node: nothing to execute
+    }
+
+    for(size_t i = 0; i < n->_num_successors; ++i) {
+      Node* s = n->_edges[i];
+      if(auto it = remaining.find(s);
+         it != remaining.end() && it->second > 0 && --(it->second) == 0) {
+        if(pushed.insert(s).second) {
+          ready.push_back(s);
+        }
+      }
+    }
+  }
 }
 
 // Procedure: _corun_graph
