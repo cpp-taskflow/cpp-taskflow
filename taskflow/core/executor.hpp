@@ -1408,7 +1408,7 @@ inline bool Executor::_explore_task(Worker& w, Node*& t) {
  
     if(++num_steals > MAX_STEALS) {
       std::this_thread::yield();
-      if(num_steals > 150 + MAX_STEALS) {
+      if(num_steals > 16 + MAX_STEALS) {
         break;
       }
     }
@@ -1460,7 +1460,7 @@ inline bool Executor::_explore_task(Worker& w, Node*& t) {
     // If the number of empty steals reaches MAX_STEALS, exit the loop.
     if (++num_steals > MAX_STEALS) {
       std::this_thread::yield();
-      if(num_steals > 150 + MAX_STEALS) {
+      if(num_steals > 16 + MAX_STEALS) {
         break;
       }
     }
